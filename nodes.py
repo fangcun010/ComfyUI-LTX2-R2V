@@ -13,11 +13,11 @@ from comfy_api.latest import io
 
 def _parse_guides_json(guides_json):
     if guides_json is None:
-        raise ValueError("guides_json is required")
+        return []
 
     raw = guides_json.strip()
     if not raw:
-        raise ValueError("guides_json is empty")
+        return []
 
     try:
         data = json.loads(raw)
@@ -427,7 +427,14 @@ class LTXVAddGuideMultiJsonFc:
                 ramp_frames,
             )
 
-        processed_batch = torch.cat(processed_images, dim=0)
+        if processed_images:
+            processed_batch = torch.cat(processed_images, dim=0)
+        else:
+            processed_batch = torch.empty(
+                (0, target_height, target_width, 3),
+                dtype=latent_image.dtype,
+                device=latent_image.device,
+            )
         info_text = _build_info_text(
             frame_step=time_scale_factor,
             mask_mode=mask_mode,
