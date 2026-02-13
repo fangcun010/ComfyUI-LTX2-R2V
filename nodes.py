@@ -1,5 +1,8 @@
 import json
 import os
+import base64
+import binascii
+from io import BytesIO
 from PIL import Image, ImageOps
 import numpy as np
 import torch
@@ -40,9 +43,9 @@ def _parse_guides_json(guides_json):
         if not isinstance(item, dict):
             raise ValueError(f"guide #{idx} must be an object")
 
-        image_path = item.get("image") or item.get("image_path") or item.get("path")
+        image_path = item.get("image") or item.get("image_base64") or item.get("image_path") or item.get("path")
         if not image_path:
-            raise ValueError(f"guide #{idx} missing 'image' path")
+            raise ValueError(f"guide #{idx} missing image (path/base64)")
 
         frame_idx = item.get("frame_idx", item.get("frame", 0))
         strength = item.get("strength", 1.0)
@@ -52,6 +55,53 @@ def _parse_guides_json(guides_json):
         cleaned.append({
             "image": image_path,
             "frame_idx": int(frame_idx),
+            "strength": float(strength),
+            "preprocess": bool(preprocess),
+            "preprocess_crf": int(preprocess_crf),
+        })
+
+    return cleaned
+
+
+def _parse_refs_json(refs_json):
+    if refs_json is None:
+        return []
+
+    raw = refs_json.strip()
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        if os.path.exists(raw):
+            with open(raw, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            raise
+
+    if isinstance(data, dict) and "refs" in data:
+        refs = data["refs"]
+    elif isinstance(data, list):
+        refs = data
+    else:
+        raise ValueError("refs_json must be a list or a dict with a 'refs' key")
+
+    cleaned = []
+    for idx, item in enumerate(refs):
+        if not isinstance(item, dict):
+            raise ValueError(f"ref #{idx} must be an object")
+
+        image_path = item.get("image") or item.get("image_base64") or item.get("image_path") or item.get("path")
+        if not image_path:
+            raise ValueError(f"ref #{idx} missing image (path/base64)")
+
+        strength = item.get("strength", 1.0)
+        preprocess = item.get("preprocess", True)
+        preprocess_crf = item.get("preprocess_crf", 33)
+
+        cleaned.append({
+            "image": image_path,
             "strength": float(strength),
             "preprocess": bool(preprocess),
             "preprocess_crf": int(preprocess_crf),
@@ -85,6 +135,53 @@ def _load_image_tensor(image_path):
         img = img.convert("RGB")
     image = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(image)[None,]
+
+
+def _load_image_tensor_from_base64(image_data):
+    raw = image_data.strip()
+    if raw.startswith("data:"):
+        comma_idx = raw.find(",")
+        if comma_idx == -1:
+            raise ValueError("Invalid data URI for image")
+        raw = raw[comma_idx + 1:]
+    elif raw.startswith("base64,"):
+        raw = raw[len("base64,"):]
+
+    raw = "".join(raw.split())
+    if not raw:
+        raise ValueError("Empty base64 image data")
+
+    padded = raw + ("=" * ((4 - (len(raw) % 4)) % 4))
+    try:
+        image_bytes = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError("Invalid base64 image data") from e
+
+    img = Image.open(BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    image = np.array(img).astype(np.float32) / 255.0
+    return torch.from_numpy(image)[None,]
+
+
+def _load_image_tensor_from_json_value(image_value):
+    if not isinstance(image_value, str):
+        raise ValueError("image must be a string (path or base64)")
+
+    value = image_value.strip()
+    if not value:
+        raise ValueError("image is empty")
+
+    maybe_data_uri = value.startswith("data:") or value.startswith("base64,")
+    if not maybe_data_uri:
+        try:
+            resolved = _resolve_image_path(value)
+            return _load_image_tensor(resolved)
+        except FileNotFoundError:
+            pass
+
+    return _load_image_tensor_from_base64(value)
 
 
 _LTXV_PATCHIFIER = SymmetricPatchifier(1, start_end=True)
@@ -370,8 +467,7 @@ class LTXVAddGuideMultiJsonFc:
         guide_info = []
 
         for guide in guides:
-            image_path = _resolve_image_path(guide["image"])
-            img = _load_image_tensor(image_path)
+            img = _load_image_tensor_from_json_value(guide["image"])
             img = _resize_for_preprocess(img, target_width, target_height, upscale_method)
             if guide.get("preprocess", True):
                 img = nodes_lt.LTXVPreprocess().execute(
@@ -859,6 +955,157 @@ class LTXVAddRefMultiFc(io.ComfyNode):
         )
 
 
+class LTXVAddRefMultiJsonFc:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "latent": ("LATENT",),
+                "step_multiplier": (
+                    "INT",
+                    {"default": 2, "min": 1, "max": 100, "step": 1},
+                ),
+                "mask_mode": (
+                    ["constant", "ramp"],
+                    {"default": "constant"},
+                ),
+                "ramp_frames": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 64, "step": 1},
+                ),
+                "upscale_method": (
+                    ["nearest-exact", "bilinear", "lanczos"],
+                    {"default": "nearest-exact"},
+                ),
+                "negative_frame_mode": (
+                    ["allow_cross_zero", "before_start"],
+                    {"default": "allow_cross_zero"},
+                ),
+                "refs_json": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("positive", "negative", "latent", "processed_images", "frame_step", "info")
+    FUNCTION = "add"
+    CATEGORY = "LTX2"
+
+    def add(
+        self,
+        positive,
+        negative,
+        vae,
+        latent,
+        step_multiplier,
+        mask_mode,
+        ramp_frames,
+        upscale_method,
+        negative_frame_mode,
+        refs_json,
+    ):
+        refs = _parse_refs_json(refs_json)
+
+        scale_factors = vae.downscale_index_formula
+        frame_step = scale_factors[0]
+        effective_step = frame_step * step_multiplier
+        latent_image = latent["samples"]
+        noise_mask = _get_noise_mask(latent)
+
+        _, _, latent_length, latent_height, latent_width = latent_image.shape
+        _, width_scale_factor, height_scale_factor = scale_factors
+        target_width = latent_width * width_scale_factor
+        target_height = latent_height * height_scale_factor
+
+        processed_images = []
+        guide_info = []
+
+        for ref_index, ref in enumerate(refs, start=1):
+            img = _load_image_tensor_from_json_value(ref["image"])
+            strength = ref["strength"]
+            frame_idx = -effective_step * ref_index
+
+            img = _resize_for_preprocess(img, target_width, target_height, upscale_method)
+            if ref.get("preprocess", True):
+                img = nodes_lt.LTXVPreprocess().execute(
+                    img,
+                    ref.get("preprocess_crf", 33),
+                )[0]
+            processed_images.append(img)
+
+            image_1, t = _encode_guide(vae, latent_width, latent_height, img, scale_factors)
+            image_1, t = _maybe_expand_guide(image_1, t, mask_mode, ramp_frames)
+            frame_idx = _adjust_negative_frame_idx(
+                frame_idx,
+                len(image_1),
+                frame_step,
+                negative_frame_mode,
+            )
+            frame_idx, latent_idx = _get_latent_index(
+                positive,
+                latent_length,
+                len(image_1),
+                frame_idx,
+                scale_factors,
+            )
+
+            guide_frames = t.shape[2]
+            latent_ids = list(range(latent_idx, latent_idx + guide_frames))
+            frame_ids = [frame_idx + frame_step * k for k in range(guide_frames)]
+            guide_info.append(
+                "ref#{idx}: frame_idx={frame_idx}; latent_ids={latent_ids}; frame_ids={frame_ids}; strength={strength}".format(
+                    idx=len(guide_info) + 1,
+                    frame_idx=frame_idx,
+                    latent_ids=_format_id_list(latent_ids),
+                    frame_ids=_format_id_list(frame_ids),
+                    strength=strength,
+                )
+            )
+            if latent_idx + t.shape[2] > latent_length:
+                raise ValueError("Conditioning frames exceed the length of the latent sequence.")
+
+            positive, negative, latent_image, noise_mask = _append_keyframe(
+                positive,
+                negative,
+                frame_idx,
+                latent_image,
+                noise_mask,
+                t,
+                strength,
+                scale_factors,
+                mask_mode,
+                ramp_frames,
+            )
+
+        if processed_images:
+            processed_batch = torch.cat(processed_images, dim=0)
+        else:
+            processed_batch = torch.empty(
+                (0, target_height, target_width, 3),
+                dtype=latent_image.dtype,
+                device=latent_image.device,
+            )
+        info_text = _build_info_text(
+            frame_step=frame_step,
+            mask_mode=mask_mode,
+            ramp_frames=ramp_frames,
+            negative_frame_mode=negative_frame_mode,
+            upscale_method=upscale_method,
+            guide_info=guide_info,
+            step_multiplier=step_multiplier,
+        )
+        return (
+            positive,
+            negative,
+            {"samples": latent_image, "noise_mask": noise_mask},
+            processed_batch,
+            frame_step,
+            info_text,
+        )
+
+
 class LTX2R2VBrowserLLM(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -930,6 +1177,7 @@ NODE_CLASS_MAPPINGS = {
     "LTXVAddGuideMultiJsonFc": LTXVAddGuideMultiJsonFc,
     "LTXVAddGuideMultiFc": LTXVAddGuideMultiFc,
     "LTXVAddRefMultiFc": LTXVAddRefMultiFc,
+    "LTXVAddRefMultiJsonFc": LTXVAddRefMultiJsonFc,
     "LTX2R2VBrowserLLM": LTX2R2VBrowserLLM,
 }
 
@@ -937,5 +1185,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXVAddGuideMultiJsonFc": "LTXV Add Guide Multi (JSON) FC",
     "LTXVAddGuideMultiFc": "LTXV Add Guide Multi FC",
     "LTXVAddRefMultiFc": "LTXV Add Ref Multi FC",
+    "LTXVAddRefMultiJsonFc": "LTXV Add Ref Multi (JSON) FC",
     "LTX2R2VBrowserLLM": "LTX2 R2V Browser LLM",
 }
